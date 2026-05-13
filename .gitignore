@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 数据目录 — 来自私有仓库，禁止提交到公共仓库
+data/
+work/
+
+# 临时克隆
+_data_repo/
+_push_repo/
+
+# Claude
+.claude/

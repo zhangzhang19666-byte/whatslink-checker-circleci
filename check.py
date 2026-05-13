@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+whatslink.info ed2k 链接批量验证器 — 适配 CircleCI
+
+两种运行模式:
+  1. 本地:  从 data/ 读取 txt（每行一条 ed2k 链接），结果写入 work/
+  2. CircleCI: 通过 cache 续接进度，Artifacts 查看结果
+
+环境变量:
+  TXT_FILE    : 指定 data/ 下某个文件名，或 all（默认 all）
+  DELAY_SECS  : 正常请求间隔秒数（默认 2.8）
+  RETRY_DELAY : 重试请求间隔秒数（默认 5）
+  DATA_DIR    : 输入目录（默认 <脚本目录>/data）
+  WORK_DIR    : 输出目录（默认 <脚本目录>/work）
+  CI          : 设为 true 启用 CI 模式（自动生成 summary.html）
+"""
+
+import argparse
+import json
+import os
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Set, Tuple
+
+import requests
+
+
+def read_text(path: Path) -> str:
+    """尝试多种编码读取文件，兼容 UTF-8 / UTF-8 BOM / UTF-16 / GBK"""
+    for enc in ("utf-8-sig", "utf-16", "gbk", "latin-1"):
+        try:
+            return path.read_text(encoding=enc)
+        except (UnicodeDecodeError, Exception):
+            continue
+    return ""
+
+
+# ── 目录 ──────────────────────────────────────────────────────────────
+SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR   = Path(os.environ.get("DATA_DIR", SCRIPT_DIR / "data"))
+WORK_DIR   = Path(os.environ.get("WORK_DIR", SCRIPT_DIR / "work"))
+CI_MODE    = os.environ.get("CI", "").lower() in ("true", "1", "yes")
+
+DATA_DIR.mkdir(exist_ok=True)
+WORK_DIR.mkdir(exist_ok=True)
+
+COMPLETED_FILE = WORK_DIR / ".completed"
+
+# ── API ───────────────────────────────────────────────────────────────
+API         = "https://whatslink.info/api/v1/link"
+DELAY       = float(os.environ.get("DELAY_SECS", "2.8"))
+RETRY_DELAY = float(os.environ.get("RETRY_DELAY", "5.0"))
+RETRY_WAITS = [90, 90, 90]
+
+
+def log(msg: str):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+# ── 已完成文件标记 ─────────────────────────────────────────────────────
+
+def load_completed() -> Set[str]:
+    if not COMPLETED_FILE.exists():
+        return set()
+    return {l.strip() for l in read_text(COMPLETED_FILE).splitlines() if l.strip()}
+
+
+def mark_completed(stem: str):
+    done = load_completed()
+    if stem not in done:
+        done.add(stem)
+        COMPLETED_FILE.write_text("\n".join(sorted(done)) + "\n", "utf-8")
+        log(f"  [{stem}] 完成标记已写入")
+
+
+# ── JSONL 进度（每条 URL 一行，重复 URL 以最后一条为准）──────────────
+
+def load_progress(stem: str) -> Dict[str, dict]:
+    """返回 {url: record}，重复 url 保留最后写入的记录"""
+    p = WORK_DIR / f"{stem}.jsonl"
+    records: Dict[str, dict] = {}
+    if p.exists():
+        for line in read_text(p).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                records[rec["url"]] = rec
+            except Exception:
+                pass
+    return records
+
+
+def append_record(stem: str, rec: dict):
+    """追加一条记录到 JSONL（重试时再追加，load 时取最后一条）"""
+    p = WORK_DIR / f"{stem}.jsonl"
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+# ── API 调用 ──────────────────────────────────────────────────────────
+
+def check_url(url: str, label: str) -> Tuple[str, dict]:
+    """返回 (status, data)  status: "success" | "failed" | "quota_limited" """
+    log(f"  {label} {url[:90]}")
+    try:
+        resp = requests.get(API, params={"url": url}, timeout=30)
+        data = resp.json()
+        if data.get("error") == "quota_limited":
+            log("          ⏳ 被限流")
+            return "quota_limited", data
+        if data.get("screenshots"):
+            log("          ✅ 有效")
+            return "success", data
+        log("          ❌ 无效")
+        return "failed", data
+    except Exception as e:
+        log(f"          ❌ 请求异常: {e}")
+        return "failed", {"error": str(e)}
+
+
+# ── 单文件成功 txt ────────────────────────────────────────────────────
+
+def save_file_success_txt(stem: str, done_map: Dict[str, dict]):
+    success = sorted(u for u, r in done_map.items() if r.get("status") == "success")
+    out = WORK_DIR / f"{stem}_success.txt"
+    out.write_text("\n".join(success) + ("\n" if success else ""), "utf-8")
+    return success
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  单文件处理
+# ═══════════════════════════════════════════════════════════════════════
+
+def process_file(txt_path: Path) -> List[str]:
+    """处理一个 txt 文件，返回所有成功的 ed2k URL 列表。
+    - 已完成 URL 跳过（断点续传）
+    - 限流 URL 多轮重试
+    """
+    stem = txt_path.stem
+    log(f"\n{'━'*60}")
+    log(f"▶  {txt_path.name}")
+    log(f"{'━'*60}")
+
+    all_urls = [u.strip() for u in read_text(txt_path).splitlines()
+                if u.strip() and not u.startswith("#")]
+    done_map = load_progress(stem)
+
+    pending     = [u for u in all_urls if u not in done_map]
+    quota_retry = [u for u, r in done_map.items() if r.get("status") == "quota_limited"]
+
+    log(f"  总计 {len(all_urls)} 条 | 已完成(非限流) {len(done_map) - len(quota_retry)} | "
+        f"待处理 {len(pending)} | 限流待重试 {len(quota_retry)}")
+
+    # ── 第一轮：处理未处理过的 pending ──────────────────────────────
+    if pending:
+        log(f"\n  ── 首次处理 {len(pending)} 条 ──")
+        new_quota: List[str] = []
+        for i, url in enumerate(pending, 1):
+            label = f"[{i:>4}/{len(pending)}]"
+            status, data = check_url(url, label)
+            rec = {"url": url, "status": status, "data": data, "ts": datetime.now().isoformat()}
+            done_map[url] = rec
+            append_record(stem, rec)
+            if status == "quota_limited":
+                new_quota.append(url)
+            time.sleep(DELAY)
+        quota_retry = quota_retry + new_quota
+        save_file_success_txt(stem, done_map)
+
+    # ── 3 轮重试 ────────────────────────────────────────────────────
+    if quota_retry:
+        log(f"\n  共有 {len(quota_retry)} 条限流，开始重试（共 {len(RETRY_WAITS)} 轮）")
+
+    for rnd, wait in enumerate(RETRY_WAITS, 1):
+        if not quota_retry:
+            break
+        log(f"\n  ── 第 {rnd}/{len(RETRY_WAITS)} 轮重试 {len(quota_retry)} 条，"
+            f"等待 {wait}s... ──")
+        time.sleep(wait)
+
+        still_limited: List[str] = []
+        for i, url in enumerate(quota_retry, 1):
+            label = f"[重试{rnd} {i:>3}/{len(quota_retry)}]"
+            status, data = check_url(url, label)
+            rec = {"url": url, "status": status, "data": data, "ts": datetime.now().isoformat()}
+            done_map[url] = rec
+            append_record(stem, rec)
+            if status == "quota_limited":
+                still_limited.append(url)
+            time.sleep(RETRY_DELAY)
+
+        resolved = len(quota_retry) - len(still_limited)
+        log(f"  第 {rnd} 轮完成：解决 {resolved} 条，仍限流 {len(still_limited)} 条")
+        quota_retry = still_limited
+        save_file_success_txt(stem, done_map)
+
+    if quota_retry:
+        log(f"  ⚠️  3 轮后仍有 {len(quota_retry)} 条限流，留待下次运行续接")
+
+    ok  = sum(1 for r in done_map.values() if r.get("status") == "success")
+    bad = sum(1 for r in done_map.values() if r.get("status") == "failed")
+    lim = sum(1 for r in done_map.values() if r.get("status") == "quota_limited")
+    log(f"\n  [{stem}] 结果: ✅ 有效 {ok} | ❌ 无效 {bad} | ⏳ 仍限流 {lim}")
+
+    success_urls = save_file_success_txt(stem, done_map)
+    log(f"  [{stem}] 已保存 -> work/{stem}_success.txt ({len(success_urls)} 条)")
+
+    if lim == 0:
+        mark_completed(stem)
+
+    return success_urls
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  主程序
+# ═══════════════════════════════════════════════════════════════════════
+
+def collect_txt_files(txt_file: str) -> List[Path]:
+    if txt_file.lower() != "all":
+        p = DATA_DIR / txt_file
+        if not p.exists():
+            raise FileNotFoundError(f"文件不存在: {p}")
+        return [p]
+    files = sorted(DATA_DIR.glob("*.txt"))
+    if not files:
+        raise FileNotFoundError(f"data/ 目录下没有 txt 文件: {DATA_DIR}")
+    return files
+
+
+def print_status(txt_files: List[Path]):
+    completed = load_completed()
+    print("\n" + "=" * 68)
+    print(f"  {'文件':<36} {'状态':<10} {'✅成功':>6} {'❌无效':>6} {'⏳限流':>6}")
+    print(f"  {'─'*36} {'─'*10} {'─'*6} {'─'*6} {'─'*6}")
+    for f in txt_files:
+        stem  = f.stem
+        total = sum(1 for l in read_text(f).splitlines() if l.strip())
+        jsonl = WORK_DIR / f"{stem}.jsonl"
+        if not jsonl.exists():
+            mark, stat = "🆕", "未开始"
+            print(f"  {mark+' '+stem[:34]:<36} {stat:<10} {'—':>6} {'—':>6} {total:>6}")
+            continue
+        dm  = load_progress(stem)
+        ok  = sum(1 for r in dm.values() if r.get("status") == "success")
+        bad = sum(1 for r in dm.values() if r.get("status") == "failed")
+        lim = sum(1 for r in dm.values() if r.get("status") == "quota_limited")
+        pct = int(len(dm) / total * 100) if total else 0
+        if stem in completed:
+            mark, stat = "✅", "已完成"
+        elif lim == 0 and len(dm) >= total:
+            mark, stat = "✅", "已完成"
+        else:
+            mark, stat = "⏳", f"{pct}%进行中"
+        print(f"  {mark+' '+stem[:34]:<36} {stat:<10} {ok:>6} {bad:>6} {lim:>6}")
+    print("=" * 68)
+
+
+def build_final_output(txt_files: List[Path]) -> Path:
+    """汇总所有文件的成功 ed2k 链接，去重，A-Z 排序"""
+    all_success: List[str] = []
+    for f in txt_files:
+        dm = load_progress(f.stem)
+        all_success.extend(u for u, r in dm.items() if r.get("status") == "success")
+
+    deduped = sorted(set(all_success))
+    out = WORK_DIR / "all_success_ed2k.txt"
+    out.write_text("\n".join(deduped) + ("\n" if deduped else ""), "utf-8")
+    log(f"\n{'='*60}")
+    log(f"汇总完成: {len(deduped)} 条有效 ed2k (去重后, A-Z 排序)")
+    log(f"输出文件: {out}")
+    return out
+
+
+# ── CI 模式: 生成 HTML 摘要供 Artifacts 查看 ──────────────────────────
+
+def generate_ci_summary(txt_files: List[Path], all_success_path: Path):
+    total_ok = 0
+    if all_success_path.exists():
+        total_ok = len(all_success_path.read_text("utf-8").splitlines())
+
+    rows = []
+    for f in txt_files:
+        dm = load_progress(f.stem)
+        ok  = sum(1 for r in dm.values() if r.get("status") == "success")
+        bad = sum(1 for r in dm.values() if r.get("status") == "failed")
+        lim = sum(1 for r in dm.values() if r.get("status") == "quota_limited")
+        rows.append(f"<tr><td>{f.stem}</td><td>{ok}</td><td>{bad}</td><td>{lim}</td></tr>")
+
+    html = """<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>ed2k Checker 结果</title>
+<style>
+body{font-family:sans-serif;margin:2em;background:#f5f5f5}
+h1{color:#333}
+table{border-collapse:collapse;width:100%;background:#fff}
+th,td{padding:8px 12px;text-align:left;border:1px solid #ddd}
+th{background:#4a90d9;color:#fff}
+tr:nth-child(even){background:#f9f9f9}
+.summary{font-size:1.2em;margin:1em 0;padding:1em;background:#fff;border-left:4px solid #4a90d9}
+</style>
+</head>
+<body>
+<h1>ed2k Link Checker 验证结果</h1>
+<div class="summary">
+<p>构建号: <b>%s</b></p>
+<p>有效链接总数: <b>%d</b></p>
+<p>数据目录: <code>%s</code></p>
+<p>输出目录: <code>%s</code></p>
+</div>
+<table>
+<tr><th>文件</th><th>✅ 有效</th><th>❌ 无效</th><th>⏳ 限流</th></tr>
+%s
+</table>
+<h2>下载</h2>
+<ul>
+<li><a href="work-results/all_success_ed2k.txt">all_success_ed2k.txt</a></li>
+</ul>
+</body>
+</html>""" % (
+        os.environ.get("CIRCLE_BUILD_NUM", os.environ.get("GITHUB_RUN_NUMBER", "?")),
+        total_ok,
+        str(DATA_DIR),
+        str(WORK_DIR),
+        "\n".join(rows),
+    )
+
+    summary_path = WORK_DIR / "summary.html"
+    summary_path.write_text(html, "utf-8")
+    log(f"CI 摘要已生成: {summary_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="ed2k 链接批量验证器")
+    parser.add_argument("--txt-file", "-t",
+                        default=os.environ.get("TXT_FILE", "all"),
+                        help="data/ 下的文件名, 或 all (默认)")
+    parser.add_argument("--status", "-s", action="store_true",
+                        help="只显示进度, 不执行")
+    args = parser.parse_args()
+
+    try:
+        txt_files = collect_txt_files(args.txt_file)
+    except FileNotFoundError as e:
+        log(f"❌ {e}")
+        return
+
+    print_status(txt_files)
+    if args.status:
+        return
+
+    completed = load_completed()
+    to_run = [f for f in txt_files if f.stem not in completed]
+
+    if not to_run:
+        log("所有文件均已完成, 直接生成汇总文件...")
+    else:
+        log(f"共 {len(txt_files)} 个文件, 其中 {len(to_run)} 个需要处理")
+        for txt_path in to_run:
+            try:
+                process_file(txt_path)
+            except KeyboardInterrupt:
+                log("\n用户中断, 进度已保存, 下次运行可续接")
+                build_final_output(txt_files)
+                raise SystemExit(0)
+            except Exception as e:
+                import traceback
+                log(f"❌ [{txt_path.stem}] 出错: {e}")
+                traceback.print_exc()
+
+    all_success_path = build_final_output(txt_files)
+    print_status(txt_files)
+
+    # CI 模式: 生成 HTML 摘要
+    if CI_MODE:
+        generate_ci_summary(txt_files, all_success_path)
+
+    # 判断是否需自动触发下一次
+    completed = load_completed()
+    still_pending = [f for f in txt_files if f.stem not in completed]
+    needs_rerun = False
+    for f in still_pending:
+        dm = load_progress(f.stem)
+        total = sum(1 for l in f.read_text("utf-8").splitlines() if l.strip())
+        lim   = sum(1 for r in dm.values() if r.get("status") == "quota_limited")
+        if lim > 0 or len(dm) < total:
+            needs_rerun = True
+            break
+
+    flag = WORK_DIR / ".needs_rerun"
+    if needs_rerun:
+        flag.write_text("1", "utf-8")
+        log("⏭️  仍有未完成任务, 已写入 .needs_rerun 标记, CI 将自动触发下一次")
+    else:
+        flag.unlink(missing_ok=True)
+        log("🎉 所有任务全部完成!")
+
+
+if __name__ == "__main__":
+    main()

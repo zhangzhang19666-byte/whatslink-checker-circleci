@@ -1,0 +1,135 @@
+# ed2k Link Checker — GitHub Actions Workflow
+#
+# 【存储方案】
+# data/（输入）和 work/（输出）存储在私有 GitHub 仓库中，
+# 通过 GH_PAT + DATA_REPO 访问。与 CircleCI 配置共享同一套私有库。
+#
+# 【触发方式】
+# workflow_dispatch: 手动触发
+#
+# 【Secrets 设置 (Settings → Secrets and variables → Actions)】
+#   GH_PAT    — GitHub PAT（repo 权限），必填
+#   DATA_REPO — 私有数据仓库名，格式: owner/repo，必填
+
+name: ed2k Link Checker
+
+on:
+  workflow_dispatch:
+    inputs:
+      txt_file:
+        description: 'data/ 下的文件名（留空或 all 处理全部）'
+        required: false
+        default: 'all'
+      delay_secs:
+        description: '正常请求间隔秒数（默认 2.8）'
+        required: false
+        default: '2.8'
+      retry_delay:
+        description: '限流重试轮次中每条请求间隔秒数（默认 5）'
+        required: false
+        default: '5'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout public repo
+        uses: actions/checkout@v4
+
+      # 从私有数据仓库拉取 data/ 和 work/
+      - name: Fetch data and progress from private repo
+        env:
+          GH_PAT:    ${{ secrets.GH_PAT }}
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+        run: |
+          echo "📥 从私有仓库 $DATA_REPO 拉取..."
+          git clone "https://x-access-token:${GH_PAT}@github.com/${DATA_REPO}.git" _data_repo
+          mkdir -p data
+          cp _data_repo/*.txt data/ 2>/dev/null || true
+          echo "✅ data/ 文件数: $(ls data/*.txt 2>/dev/null | wc -l)"
+          if [ -d "_data_repo/work" ]; then
+            cp -r _data_repo/work ./
+            echo "✅ work/ 进度已恢复"
+          else
+            mkdir -p work
+          fi
+          rm -rf _data_repo
+
+      - name: Show data/work status
+        run: |
+          echo "=== data/ ==="
+          ls -lh data/*.txt 2>/dev/null || echo "(empty)"
+          echo "=== work/ ==="
+          ls -lh work/ 2>/dev/null || echo "(empty)"
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ed2k checker
+        env:
+          TXT_FILE:    ${{ github.event.inputs.txt_file || 'all' }}
+          DELAY_SECS:  ${{ github.event.inputs.delay_secs || '2.8' }}
+          RETRY_DELAY: ${{ github.event.inputs.retry_delay || '5' }}
+          CI:          'true'
+        run: python check.py
+
+      # 推回私有仓库
+      - name: Push results back to private repo
+        if: always()
+        env:
+          GH_PAT:    ${{ secrets.GH_PAT }}
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+        run: |
+          echo "📤 推送 work/ 到私有仓库 $DATA_REPO..."
+          if [ ! -d "work" ] || [ -z "$(ls -A work/ 2>/dev/null)" ]; then
+            echo "ℹ️  work/ 无内容，跳过推送"
+            exit 0
+          fi
+          git clone "https://x-access-token:${GH_PAT}@github.com/${DATA_REPO}.git" _push_repo
+          rm -rf _push_repo/work
+          cp -r work _push_repo/work
+          cd _push_repo
+          git config user.email "action@github.com"
+          git config user.name "GitHub Actions"
+          git add work/
+          if git diff --cached --quiet; then
+            echo "✅ 无变化，跳过推送"
+          else
+            git commit -m "update work/ [run #${{ github.run_number }}]"
+            git push "https://x-access-token:${GH_PAT}@github.com/${DATA_REPO}.git" main
+            echo "✅ work/ 已推送"
+          fi
+
+      # 上传 Artifacts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: work-results
+          path: work/
+          retention-days: 30
+
+      # 自动触发下一次
+      - name: Auto-trigger next run if needed
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ ! -f "work/.needs_rerun" ]; then
+            echo "🎉 All tasks completed."
+            exit 0
+          fi
+          echo "⏭️  Tasks remain, triggering next run..."
+          sleep 30
+          gh workflow run .github/workflows/check.yml \
+            --repo ${{ github.repository }} \
+            --ref ${{ github.ref_name }} \
+            -f txt_file=all
+          echo "✅ Next run triggered"

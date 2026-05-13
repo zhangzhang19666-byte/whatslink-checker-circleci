@@ -1,0 +1,203 @@
+# ────────────────────────────────────────────────────────────────────────────
+#  ed2k Link Checker — CircleCI Pipeline
+#  ────────────────────────────────────────────────────────────────────────────
+#  【存储方案说明】
+#  数据（data/ 输入 + work/ 输出）存储在一个私有 GitHub 仓库中，
+#  CircleCI 通过 GH_PAT 访问该仓库。
+#
+#  流程:
+#  1. checkout 公共仓库 → 获取代码（无 data/ 和 work/）
+#  2. git clone 私有数据仓库 → 获取 data/*.txt（输入）和 work/（进度）
+#  3. 运行 check.py
+#  4. git push work/ 回私有仓库
+#  5. store_artifacts → CircleCI 网页查看结果
+#  6. 如有剩余任务 → API 触发下一次
+#
+#  【环境变量 — CircleCI Project Settings → Environment Variables 设置】
+#    必需:
+#      GH_PAT              — GitHub PAT（repo 权限），用于访问私有数据仓库
+#      DATA_REPO           — 私有数据仓库名，格式: owner/repo
+#      CIRCLECI_API_TOKEN  — CircleCI 个人 API 令牌（用于 auto-trigger）
+#
+#    可选:
+#      TXT_FILE            — data/ 下的某个文件（默认 all，处理全部）
+#      DELAY_SECS           — 正常请求间隔（默认 2.8）
+#      RETRY_DELAY          — 重试间隔（默认 5）
+# ────────────────────────────────────────────────────────────────────────────
+
+version: 2.1
+
+orbs:
+  python: circleci/python@2.1.1
+
+# ─── 命令 ──────────────────────────────────────────────────────────────────
+commands:
+  fetch-data-repo:
+    description: "Clone private data repo to get data/ and work/"
+    steps:
+      - run:
+          name: Fetch data and progress from private repo
+          command: |
+            echo "📥 从私有仓库 ${DATA_REPO} 拉取..."
+            git clone "https://x-access-token:${GH_PAT}@github.com/${DATA_REPO}.git" _data_repo
+            mkdir -p data
+            cp _data_repo/*.txt data/ 2>/dev/null || true
+            echo "✅ data/ 文件数: $(ls data/*.txt 2>/dev/null | wc -l)"
+            if [ -d "_data_repo/work" ]; then
+              cp -r _data_repo/work ./
+              echo "✅ work/ 进度已恢复 ($(ls work/*.jsonl 2>/dev/null | wc -l) jsonl)"
+            else
+              mkdir -p work
+              echo "ℹ️  无已有 work/，全新开始"
+            fi
+            rm -rf _data_repo
+
+  push-work-repo:
+    description: "Push work/ results back to private data repo"
+    steps:
+      - run:
+          name: Push results back to private repo
+          command: |
+            echo "📤 推送 work/ 到私有仓库 ${DATA_REPO}..."
+            if [ ! -d "work" ] || [ -z "$(ls -A work/ 2>/dev/null | grep -v '^\.')" ]; then
+              echo "ℹ️  work/ 无内容，跳过推送"
+              exit 0
+            fi
+            git clone "https://x-access-token:${GH_PAT}@github.com/${DATA_REPO}.git" _push_repo
+            rm -rf _push_repo/work
+            cp -r work _push_repo/work
+            cd _push_repo
+            git config user.email "circleci@builder.ci"
+            git config user.name "CircleCI Builder"
+            git add work/
+            if git diff --cached --quiet; then
+              echo "✅ 无变化，跳过推送"
+            else
+              git commit -m "update work/ [ci build #${CIRCLE_BUILD_NUM}]"
+              git push "https://x-access-token:${GH_PAT}@github.com/${DATA_REPO}.git" main
+              echo "✅ work/ 已推送"
+            fi
+            cd .. && rm -rf _push_repo
+
+  install-python-deps:
+    description: "Install Python dependencies with pip cache"
+    steps:
+      - restore_cache:
+          name: Restore pip cache
+          keys:
+            - v1-pip-{{ checksum "requirements.txt" }}
+            - v1-pip-
+      - run:
+          name: Install dependencies
+          command: pip install -r requirements.txt
+      - save_cache:
+          name: Save pip cache
+          key: v1-pip-{{ checksum "requirements.txt" }}
+          paths:
+            - ~/.cache/pip
+
+# ─── Job: 核心检查任务 ─────────────────────────────────────────────────────
+jobs:
+  check-links:
+    docker:
+      - image: cimg/python:3.11
+    resource_class: large
+    environment:
+      TXT_FILE: all
+      CI: "true"
+    steps:
+      # 第 1 步: checkout 公共仓库（获取代码，不含 data/ 和 work/）
+      - checkout
+
+      # 第 2 步: 从私有仓库拉数据
+      - fetch-data-repo
+
+      # 第 3 步: 查看状态
+      - run:
+          name: Show data/work status
+          command: |
+            echo "=== data/ ==="
+            ls -lh data/*.txt 2>/dev/null || echo "(empty)"
+            echo "=== work/ ==="
+            ls -lh work/ 2>/dev/null || echo "(empty)"
+            echo "=== 进度摘要 ==="
+            ls work/*.jsonl 2>/dev/null | wc -l && echo "jsonl files" || echo "0 jsonl"
+
+      # 第 4 步: 安装依赖
+      - install-python-deps
+
+      # 第 5 步: 运行验证器
+      - run:
+          name: Run ed2k link checker
+          command: python check.py
+          no_output_timeout: 30m
+
+      # 第 6 步: 推送结果回私有仓库
+      - push-work-repo
+
+      # 第 7 步: 上传 Artifacts
+      - store_artifacts:
+          path: work/summary.html
+          destination: summary.html
+      - store_artifacts:
+          path: work/
+          destination: work-results
+
+      # 第 8 步: 自动触发下一次
+      - run:
+          name: Auto-trigger next run if tasks remain
+          when: always
+          command: |
+            if [ ! -f "work/.needs_rerun" ]; then
+              echo "🎉 All tasks completed. No rerun needed."
+              exit 0
+            fi
+            echo "⏭️  .needs_rerun detected — triggering next pipeline..."
+            sleep 30
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST \
+              "https://circleci.com/api/v2/project/gh/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/pipeline" \
+              -H "Circle-Token: ${CIRCLECI_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              -d "{\"branch\":\"${CIRCLE_BRANCH}\"}")
+            if [ "$STATUS" = "201" ] || [ "$STATUS" = "200" ]; then
+              echo "✅ Next pipeline triggered (HTTP $STATUS)"
+            else
+              echo "❌ Trigger failed (HTTP $STATUS) — check CIRCLECI_API_TOKEN"
+            fi
+
+# ─── Job: 状态检查 ─────────────────────────────────────────────────────────
+  check-status:
+    docker:
+      - image: cimg/python:3.11
+    steps:
+      - checkout
+      - fetch-data-repo
+      - install-python-deps
+      - run:
+          name: Show processing status
+          command: python check.py --status
+
+# ─── Workflows ────────────────────────────────────────────────────────────
+workflows:
+  version: 2
+  main-workflow:
+    jobs:
+      - check-links:
+          filters:
+            branches:
+              only:
+                - main
+
+  nightly-check:
+    triggers:
+      - schedule:
+          name: "Daily check at 08:00 UTC"
+          cron: "0 8 * * *"
+          filters:
+            branches:
+              only:
+                - main
+    jobs:
+      - check-links
