@@ -290,43 +290,39 @@ def generate_ci_summary(txt_files: List[Path], all_success_path: Path):
         lim = sum(1 for r in dm.values() if r.get("status") == "quota_limited")
         rows.append(f"<tr><td>{f.stem}</td><td>{ok}</td><td>{bad}</td><td>{lim}</td></tr>")
 
-    html = """<!DOCTYPE html>
+    build_num = os.environ.get("CIRCLE_BUILD_NUM", os.environ.get("GITHUB_RUN_NUMBER", "?"))
+    rows_html = "\n".join(rows)
+    html = f"""<!DOCTYPE html>
 <html lang="zh">
 <head><meta charset="utf-8"><title>ed2k Checker 结果</title>
 <style>
-body{font-family:sans-serif;margin:2em;background:#f5f5f5}
-h1{color:#333}
-table{border-collapse:collapse;width:100%;background:#fff}
-th,td{padding:8px 12px;text-align:left;border:1px solid #ddd}
-th{background:#4a90d9;color:#fff}
-tr:nth-child(even){background:#f9f9f9}
-.summary{font-size:1.2em;margin:1em 0;padding:1em;background:#fff;border-left:4px solid #4a90d9}
+body{{font-family:sans-serif;margin:2em;background:#f5f5f5}}
+h1{{color:#333}}
+table{{border-collapse:collapse;width:100%;background:#fff}}
+th,td{{padding:8px 12px;text-align:left;border:1px solid #ddd}}
+th{{background:#4a90d9;color:#fff}}
+tr:nth-child(even){{background:#f9f9f9}}
+.summary{{font-size:1.2em;margin:1em 0;padding:1em;background:#fff;border-left:4px solid #4a90d9}}
 </style>
 </head>
 <body>
 <h1>ed2k Link Checker 验证结果</h1>
 <div class="summary">
-<p>构建号: <b>%s</b></p>
-<p>有效链接总数: <b>%d</b></p>
-<p>数据目录: <code>%s</code></p>
-<p>输出目录: <code>%s</code></p>
+<p>构建号: <b>{build_num}</b></p>
+<p>有效链接总数: <b>{total_ok}</b></p>
+<p>数据目录: <code>{str(DATA_DIR)}</code></p>
+<p>输出目录: <code>{str(WORK_DIR)}</code></p>
 </div>
 <table>
 <tr><th>文件</th><th>✅ 有效</th><th>❌ 无效</th><th>⏳ 限流</th></tr>
-%s
+{rows_html}
 </table>
 <h2>下载</h2>
 <ul>
 <li><a href="work-results/all_success_ed2k.txt">all_success_ed2k.txt</a></li>
 </ul>
 </body>
-</html>""" % (
-        os.environ.get("CIRCLE_BUILD_NUM", os.environ.get("GITHUB_RUN_NUMBER", "?")),
-        total_ok,
-        str(DATA_DIR),
-        str(WORK_DIR),
-        "\n".join(rows),
-    )
+</html>"""
 
     summary_path = WORK_DIR / "summary.html"
     summary_path.write_text(html, "utf-8")
