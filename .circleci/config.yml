@@ -193,7 +193,6 @@ workflows:
   nightly-check:
     triggers:
       - schedule:
-          name: "Daily check at 08:00 UTC"
           cron: "0 8 * * *"
           filters:
             branches:
